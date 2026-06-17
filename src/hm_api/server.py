@@ -1030,6 +1030,11 @@ def build_app(
                     created_at=created,
                 )
                 if message_added:
+                    for item in final_response["output"]:
+                        if isinstance(item, dict) and item.get("type") == "message":
+                            item["id"] = message_item_id
+                            break
+                if message_added:
                     yield sse_event(
                         "response.output_text.done",
                         {
