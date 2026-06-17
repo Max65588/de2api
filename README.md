@@ -19,14 +19,14 @@
 
 ## ✨ Features
 
-- **OpenAI-compatible** — `/v1/models` and `/v1/chat/completions`
+- **OpenAI-compatible** — `/v1/models`, `/v1/chat/completions`, and `/v1/responses`
 - **Streaming & non-streaming** — automatic SSE forwarding and `/no-stream` fallback
 - **Built-in auth** — optional `--key` API key protection
 - **Proxy support** — pass upstream HTTP/HTTPS proxy to `httpx`
 - **Multi-account management** — add, switch, and delete DevEco accounts in a web UI
 - **Encrypted credentials** — local account tokens stored safely under `./cred`
 - **Admin UI** — password-protected React + shadcn/ui console at `/admin`
-- **Call logs** — local metadata logs for model and chat completion requests
+- **Call logs** — local metadata logs for model, chat completion, and response requests
 - **Async powered** — FastAPI + `httpx` + `uvloop`
 
 ---
@@ -119,7 +119,32 @@ curl http://localhost:8000/v1/chat/completions \
     "model": "GLM-5.1",
     "messages": [{"role": "user", "content": "Hello!"}]
   }'
+
+# response (non-streaming)
+curl http://localhost:8000/v1/responses \
+  -H "Authorization: Bearer your-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "GLM-5.1",
+    "input": "Hello!"
+  }'
+
+# response (streaming)
+curl -N http://localhost:8000/v1/responses \
+  -H "Authorization: Bearer your-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "GLM-5.1",
+    "input": "Hello!",
+    "stream": true
+  }'
 ```
+
+### Responses API compatibility
+
+`/v1/responses` adapts OpenAI Responses requests to DevEco Chat Completions upstream calls.
+Supported features include text input/output, `instructions`, streaming response events, `store`, `previous_response_id`, response retrieval/deletion, `input_items`, function tools, and JSON response formats.
+Image input and OpenAI built-in tools such as web search, file search, and computer use are rejected with an unsupported-feature error because the current upstream does not provide stable compatible behavior for them.
 
 To use a specific saved account instead of the active account, pass the account id copied from the admin UI:
 
@@ -136,6 +161,7 @@ curl http://localhost:8000/v1/models \
 All authentication data is encrypted and stored locally under `./cred`.
 Multiple DevEco accounts are saved in `cred/auth.json`; the active account is used by default.
 API call metadata is saved in `cred/calls.jsonl` and displayed in the admin UI. Message content is not logged.
+Responses created with `store` enabled are saved in `cred/responses.json`, including input and output content, so `/v1/responses/{id}` and `previous_response_id` can work.
 Runtime configuration is stored in `cred/config.json`.
 
 Example `cred/config.json` with multiple API keys, account strategy, and default theme:

@@ -9,7 +9,7 @@ import time
 import uuid
 import zlib
 from pathlib import Path
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -37,6 +37,16 @@ from .config import (
 )
 from .login import _build_client, _parse_callback, _parse_jwt
 from .logs import append_call_log, list_call_logs
+from .response_adapter import (
+    append_tool_delta,
+    build_chat_request,
+    chat_completion_to_response,
+    chat_tool_call_to_response,
+    new_response_id,
+    output_text,
+    sse_event,
+)
+from .response_store import delete_response, get_input_items, get_response, save_response
 from .settings import ApiKey, generate_api_key, load_app_config, read_app_config_data, write_app_config_data
 
 
@@ -200,6 +210,25 @@ def _duration_ms(started_at: float) -> int:
 def _error_summary(text: str, limit: int = 300) -> str:
     compact = " ".join(text.split())
     return compact[:limit]
+
+
+def _extract_sse_data(line: str) -> str | None:
+    if not line.startswith("data:"):
+        return None
+    return line[5:].strip()
+
+
+def _list_response(data: list[dict], *, limit: int = 20, order: str = "desc") -> dict:
+    limit = max(1, min(limit, 100))
+    ordered = data if order == "asc" else list(reversed(data))
+    page = ordered[:limit]
+    return {
+        "object": "list",
+        "data": page,
+        "first_id": page[0].get("id") if page else None,
+        "last_id": page[-1].get("id") if page else None,
+        "has_more": len(ordered) > limit,
+    }
 
 
 def build_app(
@@ -734,6 +763,400 @@ def build_app(
                 else {"data": upstream_resp.text},
             status_code=upstream_resp.status_code,
         )
+
+    @app.post("/v1/responses", response_model=None)
+    async def create_response(request: Request) -> StreamingResponse | JSONResponse:
+        started_at = time.perf_counter()
+        request_id = uuid.uuid4().hex
+        response_id = new_response_id()
+        api_key_name = _request_api_key_name(request)
+        requested_account_id = _request_account_id(request)
+        account_id = _choose_account_id(
+            requested_account_id=requested_account_id,
+            api_key_name=api_key_name,
+            account_strategy=account_strategy,
+            rr_state=rr_state,
+        )
+        token = _current_access_token(account_id)
+        if not token:
+            append_call_log(
+                {
+                    "request_id": request_id,
+                    "endpoint": "/v1/responses",
+                    "method": "POST",
+                    "account_id": account_id or "",
+                    "api_key_name": api_key_name,
+                    "status_code": 401,
+                    "duration_ms": _duration_ms(started_at),
+                    "error": "Not logged in",
+                }
+            )
+            raise HTTPException(status_code=401, detail="Not logged in")
+
+        body_bytes = await request.body()
+        if not body_bytes:
+            body_bytes = b"{}"
+        try:
+            body_json = json.loads(body_bytes)
+        except json.JSONDecodeError:
+            append_call_log(
+                {
+                    "request_id": request_id,
+                    "endpoint": "/v1/responses",
+                    "method": "POST",
+                    "account_id": account_id or "",
+                    "api_key_name": api_key_name,
+                    "status_code": 400,
+                    "duration_ms": _duration_ms(started_at),
+                    "error": "Invalid JSON body",
+                }
+            )
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
+        if not isinstance(body_json, dict):
+            raise HTTPException(status_code=400, detail="JSON body must be an object")
+
+        previous_response = None
+        previous_response_id = body_json.get("previous_response_id")
+        if previous_response_id:
+            previous_response = get_response(str(previous_response_id))
+            if previous_response is None:
+                raise HTTPException(status_code=404, detail="Previous response not found")
+
+        chat_body, input_items = build_chat_request(body_json, previous_response=previous_response)
+        stream = bool(body_json.get("stream"))
+        model = str(body_json.get("model") or "")
+        target_path = "v2/chat/completions" if stream else "v2/no-stream/chat/completions"
+        url = f"{TARGET_BASE}/{target_path}"
+        upstream_headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "lang": "en",
+            "Chat-Id": uuid.uuid4().hex.replace("-", ""),
+        }
+        session_id = request.headers.get("x-deveco-session") or request.headers.get("x-session-affinity")
+        if session_id:
+            upstream_headers["Session-Id"] = session_id
+        for key, value in request.headers.items():
+            lower = key.lower()
+            if lower in {
+                "host",
+                "authorization",
+                "x-hm-account-id",
+                "x-deveco-account",
+                "content-length",
+                "content-type",
+                "connection",
+                "accept-encoding",
+            }:
+                continue
+            upstream_headers[key] = value
+
+        chat_bytes = json.dumps(chat_body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+        if stream:
+            async def response_streamer() -> AsyncGenerator[bytes, None]:
+                text_parts: list[str] = []
+                tool_calls: dict[int, dict[str, Any]] = {}
+                usage: dict | None = None
+                chat_id = f"chatcmpl_{uuid.uuid4().hex}"
+                created = int(time.time())
+                message_item_id = f"msg_{uuid.uuid4().hex}"
+                message_added = False
+                tool_added: set[int] = set()
+                started_response = chat_completion_to_response(
+                    response_id=response_id,
+                    request_body=body_json,
+                    chat_data={"id": chat_id, "choices": [], "usage": None},
+                    created_at=created,
+                    status="in_progress",
+                )
+                yield sse_event("response.created", started_response)
+
+                async with client.stream("POST", url, headers=upstream_headers, content=chat_bytes) as upstream_resp:
+                    if upstream_resp.status_code != 200:
+                        text = await upstream_resp.aread()
+                        error_text = text.decode("utf-8", errors="replace") or "Upstream error"
+                        failed = chat_completion_to_response(
+                            response_id=response_id,
+                            request_body=body_json,
+                            chat_data={"id": chat_id, "choices": [], "usage": None},
+                            created_at=created,
+                            status="failed",
+                            error={"message": error_text, "type": "upstream_error"},
+                        )
+                        append_call_log(
+                            {
+                                "request_id": request_id,
+                                "endpoint": "/v1/responses",
+                                "method": "POST",
+                                "account_id": account_id or "",
+                                "api_key_name": api_key_name,
+                                "model": model,
+                                "stream": True,
+                                "status_code": upstream_resp.status_code,
+                                "duration_ms": _duration_ms(started_at),
+                                "error": _error_summary(error_text),
+                            }
+                        )
+                        yield sse_event("response.failed", failed)
+                        return
+
+                    async for line in upstream_resp.aiter_lines():
+                        data_line = _extract_sse_data(line)
+                        if not data_line:
+                            continue
+                        if data_line == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(chunk, dict):
+                            continue
+                        chat_id = str(chunk.get("id") or chat_id)
+                        chunk_created = chunk.get("created")
+                        if isinstance(chunk_created, int | float | str):
+                            created = int(chunk_created)
+                        chunk_usage = chunk.get("usage")
+                        if isinstance(chunk_usage, dict):
+                            usage = chunk_usage
+                        choices = chunk.get("choices", [])
+                        if not isinstance(choices, list):
+                            continue
+                        for choice in choices:
+                            if not isinstance(choice, dict):
+                                continue
+                            raw_delta = choice.get("delta")
+                            delta: dict[str, Any] = raw_delta if isinstance(raw_delta, dict) else {}
+                            content_delta = delta.get("content")
+                            if content_delta:
+                                if not message_added:
+                                    message_added = True
+                                    yield sse_event(
+                                        "response.output_item.added",
+                                        {
+                                            "type": "response.output_item.added",
+                                            "response_id": response_id,
+                                            "output_index": 0,
+                                            "item": {
+                                                "id": message_item_id,
+                                                "type": "message",
+                                                "status": "in_progress",
+                                                "role": "assistant",
+                                                "content": [],
+                                            },
+                                        },
+                                    )
+                                    yield sse_event(
+                                        "response.content_part.added",
+                                        {
+                                            "type": "response.content_part.added",
+                                            "response_id": response_id,
+                                            "item_id": message_item_id,
+                                            "output_index": 0,
+                                            "content_index": 0,
+                                            "part": {"type": "output_text", "text": "", "annotations": []},
+                                        },
+                                    )
+                                text_parts.append(str(content_delta))
+                                yield sse_event(
+                                    "response.output_text.delta",
+                                    {
+                                        "type": "response.output_text.delta",
+                                        "response_id": response_id,
+                                        "item_id": message_item_id,
+                                        "output_index": 0,
+                                        "content_index": 0,
+                                        "delta": str(content_delta),
+                                    },
+                                )
+                            for tool_call in delta.get("tool_calls") or []:
+                                if not isinstance(tool_call, dict):
+                                    continue
+                                index = int(tool_call.get("index", 0))
+                                append_tool_delta(tool_calls, tool_call)
+                                current = tool_calls[index]
+                                if index not in tool_added:
+                                    tool_added.add(index)
+                                    output_index = (1 if message_added else 0) + index
+                                    yield sse_event(
+                                        "response.output_item.added",
+                                        {
+                                            "type": "response.output_item.added",
+                                            "response_id": response_id,
+                                            "output_index": output_index,
+                                            "item": chat_tool_call_to_response(current),
+                                        },
+                                    )
+                                raw_function = tool_call.get("function")
+                                function: dict[str, Any] = raw_function if isinstance(raw_function, dict) else {}
+                                if function.get("arguments"):
+                                    yield sse_event(
+                                        "response.function_call_arguments.delta",
+                                        {
+                                            "type": "response.function_call_arguments.delta",
+                                            "response_id": response_id,
+                                            "item_id": current.get("id") or "",
+                                            "output_index": (1 if message_added else 0) + index,
+                                            "delta": str(function.get("arguments")),
+                                        },
+                                    )
+
+                message = {
+                    "role": "assistant",
+                    "content": "".join(text_parts),
+                    "tool_calls": [tool_calls[idx] for idx in sorted(tool_calls)],
+                }
+                chat_data = {
+                    "id": chat_id,
+                    "object": "chat.completion",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+                    "usage": usage,
+                }
+                final_response = chat_completion_to_response(
+                    response_id=response_id,
+                    request_body=body_json,
+                    chat_data=chat_data,
+                    created_at=created,
+                )
+                if message_added:
+                    yield sse_event(
+                        "response.output_text.done",
+                        {
+                            "type": "response.output_text.done",
+                            "response_id": response_id,
+                            "item_id": message_item_id,
+                            "output_index": 0,
+                            "content_index": 0,
+                            "text": output_text(final_response["output"]),
+                        },
+                    )
+                for index, item in enumerate(final_response["output"]):
+                    yield sse_event(
+                        "response.output_item.done",
+                        {
+                            "type": "response.output_item.done",
+                            "response_id": response_id,
+                            "output_index": index,
+                            "item": item,
+                        },
+                    )
+                if body_json.get("store", True) is not False:
+                    save_response(final_response, input_items)
+                append_call_log(
+                    {
+                        "request_id": request_id,
+                        "endpoint": "/v1/responses",
+                        "method": "POST",
+                        "account_id": account_id or "",
+                        "api_key_name": api_key_name,
+                        "model": model,
+                        "stream": True,
+                        "status_code": 200,
+                        "duration_ms": _duration_ms(started_at),
+                    }
+                )
+                yield sse_event("response.completed", final_response)
+
+            return StreamingResponse(
+                response_streamer(),
+                status_code=200,
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache"},
+            )
+
+        upstream_resp = await client.post(url, headers=upstream_headers, content=chat_bytes)
+        if upstream_resp.status_code != 200:
+            append_call_log(
+                {
+                    "request_id": request_id,
+                    "endpoint": "/v1/responses",
+                    "method": "POST",
+                    "account_id": account_id or "",
+                    "api_key_name": api_key_name,
+                    "model": model,
+                    "stream": False,
+                    "status_code": upstream_resp.status_code,
+                    "duration_ms": _duration_ms(started_at),
+                    "error": _error_summary(upstream_resp.text or "Upstream error"),
+                }
+            )
+            return JSONResponse(
+                content={"error": {"message": upstream_resp.text or "Upstream error", "type": "upstream_error"}},
+                status_code=upstream_resp.status_code,
+            )
+        chat_data = (
+            upstream_resp.json()
+            if upstream_resp.headers.get("content-type", "").startswith("application/json")
+            else {"choices": [{"message": {"role": "assistant", "content": upstream_resp.text}}]}
+        )
+        if not isinstance(chat_data, dict):
+            chat_data = {"choices": [{"message": {"role": "assistant", "content": str(chat_data)}}]}
+        chat_created = chat_data.get("created")
+        created_at = int(chat_created) if isinstance(chat_created, int | float | str) else int(time.time())
+        response_obj = chat_completion_to_response(
+            response_id=response_id,
+            request_body=body_json,
+            chat_data=chat_data,
+            created_at=created_at,
+        )
+        if body_json.get("store", True) is not False:
+            save_response(response_obj, input_items)
+        append_call_log(
+            {
+                "request_id": request_id,
+                "endpoint": "/v1/responses",
+                "method": "POST",
+                "account_id": account_id or "",
+                "api_key_name": api_key_name,
+                "model": model,
+                "stream": False,
+                "status_code": upstream_resp.status_code,
+                "duration_ms": _duration_ms(started_at),
+            }
+        )
+        return JSONResponse(content=response_obj, status_code=upstream_resp.status_code)
+
+    @app.get("/v1/responses/{response_id}", response_model=None)
+    async def retrieve_response(response_id: str) -> JSONResponse:
+        response_obj = get_response(response_id)
+        if response_obj is None:
+            raise HTTPException(status_code=404, detail="Response not found")
+        return JSONResponse(response_obj)
+
+    @app.delete("/v1/responses/{response_id}", response_model=None)
+    async def remove_response(response_id: str) -> JSONResponse:
+        if not delete_response(response_id):
+            raise HTTPException(status_code=404, detail="Response not found")
+        return JSONResponse({"id": response_id, "object": "response.deleted", "deleted": True})
+
+    @app.get("/v1/responses/{response_id}/input_items", response_model=None)
+    async def list_response_input_items(
+        response_id: str,
+        limit: int = 20,
+        order: str = "desc",
+    ) -> JSONResponse:
+        input_items = get_input_items(response_id)
+        if input_items is None:
+            raise HTTPException(status_code=404, detail="Response not found")
+        return JSONResponse(_list_response(input_items, limit=limit, order=order))
+
+    @app.post("/v1/responses/{response_id}/cancel", response_model=None)
+    async def cancel_response(response_id: str) -> JSONResponse:
+        response_obj = get_response(response_id)
+        if response_obj is None:
+            raise HTTPException(status_code=404, detail="Response not found")
+        response_obj = {**response_obj, "status": "cancelled"}
+        save_response(response_obj, get_input_items(response_id) or [])
+        return JSONResponse(response_obj)
+
+    @app.post("/v1/responses/{response_id}/compact", response_model=None)
+    async def compact_response(response_id: str) -> JSONResponse:
+        if get_response(response_id) is None:
+            raise HTTPException(status_code=404, detail="Response not found")
+        raise HTTPException(status_code=501, detail="Response compaction is not supported")
 
     return app
 

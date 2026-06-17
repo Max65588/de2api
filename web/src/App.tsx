@@ -670,7 +670,7 @@ function LogsPage() {
       <Card>
         <CardHeader>
           <CardTitle>最近调用</CardTitle>
-          <CardDescription>展示最近 300 条 `/v1/models` 和 `/v1/chat/completions` 调用。</CardDescription>
+          <CardDescription>展示最近 300 条 `/v1/models`、`/v1/chat/completions` 和 `/v1/responses` 调用。</CardDescription>
         </CardHeader>
         <CardContent>
           <div className="overflow-x-auto">

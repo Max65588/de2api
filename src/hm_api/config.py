@@ -21,6 +21,7 @@ CRED_DIR = Path("./cred")
 TOKEN_FILE = CRED_DIR / "token.enc"
 AUTH_FILE = CRED_DIR / "auth.json"
 CALL_LOG_FILE = CRED_DIR / "calls.jsonl"
+RESPONSE_STORE_FILE = CRED_DIR / "responses.json"
 APP_CONFIG_FILE = CRED_DIR / "config.json"
 
 USER_AGENT = (
