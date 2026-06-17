@@ -871,6 +871,14 @@ def build_app(
                 message_item_id = f"msg_{uuid.uuid4().hex}"
                 message_added = False
                 tool_added: set[int] = set()
+                sequence_number = 0
+
+                def emit(event: str, data: dict[str, Any]) -> bytes:
+                    nonlocal sequence_number
+                    payload = {**data, "sequence_number": sequence_number}
+                    sequence_number += 1
+                    return sse_event(event, payload)
+
                 started_response = chat_completion_to_response(
                     response_id=response_id,
                     request_body=body_json,
@@ -878,7 +886,8 @@ def build_app(
                     created_at=created,
                     status="in_progress",
                 )
-                yield sse_event("response.created", started_response)
+                yield emit("response.created", started_response)
+                yield emit("response.in_progress", started_response)
 
                 async with client.stream("POST", url, headers=upstream_headers, content=chat_bytes) as upstream_resp:
                     if upstream_resp.status_code != 200:
@@ -906,7 +915,7 @@ def build_app(
                                 "error": _error_summary(error_text),
                             }
                         )
-                        yield sse_event("response.failed", failed)
+                        yield emit("response.failed", failed)
                         return
 
                     async for line in upstream_resp.aiter_lines():
@@ -940,7 +949,7 @@ def build_app(
                             if content_delta:
                                 if not message_added:
                                     message_added = True
-                                    yield sse_event(
+                                    yield emit(
                                         "response.output_item.added",
                                         {
                                             "type": "response.output_item.added",
@@ -955,7 +964,7 @@ def build_app(
                                             },
                                         },
                                     )
-                                    yield sse_event(
+                                    yield emit(
                                         "response.content_part.added",
                                         {
                                             "type": "response.content_part.added",
@@ -967,7 +976,7 @@ def build_app(
                                         },
                                     )
                                 text_parts.append(str(content_delta))
-                                yield sse_event(
+                                yield emit(
                                     "response.output_text.delta",
                                     {
                                         "type": "response.output_text.delta",
@@ -987,19 +996,22 @@ def build_app(
                                 if index not in tool_added:
                                     tool_added.add(index)
                                     output_index = (1 if message_added else 0) + index
-                                    yield sse_event(
+                                    added_item = chat_tool_call_to_response(current, request_body=body_json)
+                                    added_item["status"] = "in_progress"
+                                    added_item["arguments"] = ""
+                                    yield emit(
                                         "response.output_item.added",
                                         {
                                             "type": "response.output_item.added",
                                             "response_id": response_id,
                                             "output_index": output_index,
-                                            "item": chat_tool_call_to_response(current),
+                                            "item": added_item,
                                         },
                                     )
                                 raw_function = tool_call.get("function")
                                 function: dict[str, Any] = raw_function if isinstance(raw_function, dict) else {}
                                 if function.get("arguments"):
-                                    yield sse_event(
+                                    yield emit(
                                         "response.function_call_arguments.delta",
                                         {
                                             "type": "response.function_call_arguments.delta",
@@ -1035,7 +1047,8 @@ def build_app(
                             item["id"] = message_item_id
                             break
                 if message_added:
-                    yield sse_event(
+                    final_text = output_text(final_response["output"])
+                    yield emit(
                         "response.output_text.done",
                         {
                             "type": "response.output_text.done",
@@ -1043,11 +1056,39 @@ def build_app(
                             "item_id": message_item_id,
                             "output_index": 0,
                             "content_index": 0,
-                            "text": output_text(final_response["output"]),
+                            "text": final_text,
+                            "logprobs": [],
+                        },
+                    )
+                    yield emit(
+                        "response.content_part.done",
+                        {
+                            "type": "response.content_part.done",
+                            "response_id": response_id,
+                            "item_id": message_item_id,
+                            "output_index": 0,
+                            "content_index": 0,
+                            "part": {
+                                "type": "output_text",
+                                "text": final_text,
+                                "annotations": [],
+                                "logprobs": [],
+                            },
                         },
                     )
                 for index, item in enumerate(final_response["output"]):
-                    yield sse_event(
+                    if isinstance(item, dict) and item.get("type") == "function_call":
+                        yield emit(
+                            "response.function_call_arguments.done",
+                            {
+                                "type": "response.function_call_arguments.done",
+                                "response_id": response_id,
+                                "item_id": item.get("id") or "",
+                                "output_index": index,
+                                "arguments": item.get("arguments") or "",
+                            },
+                        )
+                    yield emit(
                         "response.output_item.done",
                         {
                             "type": "response.output_item.done",
@@ -1071,7 +1112,7 @@ def build_app(
                         "duration_ms": _duration_ms(started_at),
                     }
                 )
-                yield sse_event("response.completed", final_response)
+                yield emit("response.completed", final_response)
 
             return StreamingResponse(
                 response_streamer(),
@@ -1167,9 +1208,54 @@ def build_app(
 
     @app.post("/v1/responses/{response_id}/compact", response_model=None)
     async def compact_response(response_id: str) -> JSONResponse:
-        if get_response(response_id) is None:
+        response_obj = get_response(response_id)
+        if response_obj is None:
             raise HTTPException(status_code=404, detail="Response not found")
-        raise HTTPException(status_code=501, detail="Response compaction is not supported")
+        metadata = response_obj.get("metadata")
+        metadata_dict = metadata if isinstance(metadata, dict) else {}
+        compacted = {
+            **response_obj,
+            "id": new_response_id(),
+            "created_at": int(time.time()),
+            "previous_response_id": response_id,
+            "metadata": {
+                **metadata_dict,
+                "compact": True,
+            },
+        }
+        save_response(compacted, get_input_items(response_id) or [])
+        return JSONResponse(compacted)
+
+    @app.post("/v1/responses/compact", response_model=None)
+    async def compact_latest_response() -> JSONResponse:
+        compacted = {
+            "id": new_response_id(),
+            "object": "response",
+            "created_at": int(time.time()),
+            "status": "completed",
+            "background": False,
+            "error": None,
+            "incomplete_details": None,
+            "instructions": None,
+            "max_output_tokens": None,
+            "metadata": {"compact": True},
+            "model": "",
+            "output": [],
+            "output_text": "",
+            "parallel_tool_calls": True,
+            "previous_response_id": None,
+            "reasoning": {"effort": None, "summary": None},
+            "store": False,
+            "temperature": None,
+            "text": {"format": {"type": "text"}},
+            "tool_choice": "auto",
+            "tools": [],
+            "top_p": None,
+            "truncation": "disabled",
+            "usage": None,
+            "user": None,
+        }
+        return JSONResponse(compacted)
 
     return app
 

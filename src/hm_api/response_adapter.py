@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from typing import Any
@@ -49,12 +50,16 @@ def new_response_id() -> str:
 
 
 def sse_event(event: str, data: dict[str, Any]) -> bytes:
-    if event in {"response.created", "response.completed", "response.failed"} and data.get("object") == "response":
-        event_data = {"type": event, "response": data}
+    sequence_number = data.get("sequence_number", 0)
+    response_data = {key: value for key, value in data.items() if key != "sequence_number"}
+    if event in {"response.created", "response.in_progress", "response.completed", "response.failed"} and data.get(
+        "object"
+    ) == "response":
+        event_data = {"type": event, "response": response_data}
     else:
-        event_data = {**data}
+        event_data = {**response_data}
         event_data.setdefault("type", event)
-    event_data.setdefault("sequence_number", 0)
+    event_data.setdefault("sequence_number", sequence_number)
     payload = json.dumps(event_data, ensure_ascii=False, separators=(",", ":"))
     return f"event: {event}\ndata: {payload}\n\n".encode("utf-8")
 
@@ -100,14 +105,39 @@ def input_to_messages(input_value: Any) -> tuple[list[dict[str, Any]], list[dict
             messages.append({"role": role, "content": content})
             input_items.append(_normalize_input_message(entry, role))
             continue
-        if item_type == "function_call_output":
+        if item_type in {"reasoning", "web_search_call", "file_search_call", "computer_call", "image_generation_call"}:
+            input_items.append(dict(entry))
+            continue
+        if item_type in {"function_call", "custom_tool_call"}:
+            call_id = str(entry.get("call_id") or entry.get("id") or f"call_{uuid.uuid4().hex}")
+            name = str(entry.get("name") or "")
+            namespace = str(entry.get("namespace") or "")
+            if namespace:
+                name = qualify_namespace_tool_name(namespace, name)
+            arguments = str(entry.get("arguments") or entry.get("input") or "")
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": sanitize_tool_name(name), "arguments": arguments},
+                        }
+                    ],
+                }
+            )
+            input_items.append(dict(entry))
+            continue
+        if item_type in {"function_call_output", "custom_tool_call_output"}:
             call_id = str(entry.get("call_id") or "")
             output = entry.get("output", "")
             messages.append({"role": "tool", "tool_call_id": call_id, "content": str(output)})
             input_items.append(
                 {
                     "id": str(entry.get("id") or f"item_{uuid.uuid4().hex}"),
-                    "type": "function_call_output",
+                    "type": item_type,
                     "call_id": call_id,
                     "output": str(output),
                 }
@@ -158,9 +188,13 @@ def build_chat_request(
     if "max_output_tokens" in body:
         chat_body["max_tokens"] = body["max_output_tokens"]
     if "tools" in body:
-        chat_body["tools"] = convert_tools(body["tools"])
+        chat_tools = convert_tools(body["tools"])
+        if chat_tools:
+            chat_body["tools"] = chat_tools
     if "tool_choice" in body:
-        chat_body["tool_choice"] = body["tool_choice"]
+        tool_choice = convert_tool_choice(body["tool_choice"], body)
+        if tool_choice is not None:
+            chat_body["tool_choice"] = tool_choice
     response_format = convert_response_format(body)
     if response_format:
         chat_body["response_format"] = response_format
@@ -175,26 +209,143 @@ def convert_tools(tools: Any) -> list[dict[str, Any]]:
         if not isinstance(tool, dict):
             raise response_error("Each tool must be an object.", "invalid_tools")
         tool_type = tool.get("type")
-        if tool_type == "function":
-            if "function" in tool:
-                chat_tools.append(tool)
+        if tool_type in {None, "", "function", "custom"}:
+            converted = convert_function_tool(tool)
+            if converted:
+                chat_tools.append(converted)
+            continue
+        if tool_type == "namespace":
+            namespace = str(tool.get("name") or "").strip()
+            children = tool.get("tools")
+            if not isinstance(children, list):
                 continue
-            name = tool.get("name")
-            if not name:
-                raise response_error("Function tools require a name.", "invalid_tools")
-            chat_tools.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": tool.get("description", ""),
-                        "parameters": tool.get("parameters", {"type": "object", "properties": {}}),
-                    },
-                }
-            )
+            for child in children:
+                if not isinstance(child, dict):
+                    continue
+                child_type = child.get("type")
+                if child_type not in {None, "", "function", "custom"}:
+                    continue
+                child_name = responses_tool_name(child)
+                qualified_name = qualify_namespace_tool_name(namespace, child_name)
+                converted = convert_function_tool(child, override_name=qualified_name)
+                if converted:
+                    chat_tools.append(converted)
+            continue
+        if tool_type in {"web_search", "file_search", "computer_use_preview", "image_generation", "tool_search"}:
             continue
         raise response_error(f"Unsupported tool type: {tool_type}")
     return chat_tools
+
+
+def convert_tool_choice(tool_choice: Any, body: dict[str, Any]) -> Any:
+    if tool_choice is None:
+        return None
+    if isinstance(tool_choice, str) and tool_choice in {"auto", "none", "required"}:
+        return tool_choice
+    if isinstance(tool_choice, str):
+        return tool_choice
+    if not isinstance(tool_choice, dict):
+        return None
+    choice_type = tool_choice.get("type")
+    if choice_type in {"auto", "none", "required"}:
+        return choice_type
+    if choice_type in {"function", "tool", "custom"}:
+        name = str(tool_choice.get("name") or "")
+        raw_function = tool_choice.get("function")
+        function: dict[str, Any] = raw_function if isinstance(raw_function, dict) else {}
+        if not name:
+            name = str(function.get("name") or "")
+        namespace = str(tool_choice.get("namespace") or "")
+        if namespace:
+            name = qualify_namespace_tool_name(namespace, name)
+        name = qualify_tool_name_from_request(body, name)
+        if name:
+            return {"type": "function", "function": {"name": sanitize_tool_name(name)}}
+    return "auto"
+
+
+def qualify_tool_name_from_request(body: dict[str, Any], name: str) -> str:
+    if not name:
+        return ""
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return name
+    for tool in tools:
+        if not isinstance(tool, dict) or tool.get("type") != "namespace":
+            continue
+        namespace = str(tool.get("name") or "").strip()
+        children = tool.get("tools")
+        if not namespace or not isinstance(children, list):
+            continue
+        for child in children:
+            if isinstance(child, dict) and responses_tool_name(child) == name:
+                return qualify_namespace_tool_name(namespace, name)
+    return name
+
+
+def convert_function_tool(tool: dict[str, Any], override_name: str | None = None) -> dict[str, Any] | None:
+    name = (override_name or responses_tool_name(tool)).strip()
+    if not name:
+        return None
+    safe_name = sanitize_tool_name(name)
+    raw_function = tool.get("function")
+    function: dict[str, Any] = raw_function if isinstance(raw_function, dict) else {}
+    return {
+        "type": "function",
+        "function": {
+            "name": safe_name,
+            "description": responses_tool_description(tool, function),
+            "parameters": normalize_tool_parameters(responses_tool_parameters(tool, function)),
+        },
+    }
+
+
+def responses_tool_name(tool: dict[str, Any]) -> str:
+    raw_function = tool.get("function")
+    function: dict[str, Any] = raw_function if isinstance(raw_function, dict) else {}
+    return str(tool.get("name") or function.get("name") or "").strip()
+
+
+def responses_tool_description(tool: dict[str, Any], function: dict[str, Any]) -> str:
+    return str(tool.get("description") or function.get("description") or "")
+
+
+def responses_tool_parameters(tool: dict[str, Any], function: dict[str, Any]) -> Any:
+    for key in ("parameters", "parametersJsonSchema", "input_schema"):
+        if key in tool:
+            return tool[key]
+    for key in ("parameters", "parametersJsonSchema", "input_schema"):
+        if key in function:
+            return function[key]
+    return {"type": "object", "properties": {}}
+
+
+def normalize_tool_parameters(parameters: Any) -> dict[str, Any]:
+    if not isinstance(parameters, dict):
+        return {"type": "object", "properties": {}}
+    normalized = dict(parameters)
+    if not normalized.get("type"):
+        normalized["type"] = "object"
+    if normalized.get("type") == "object" and not isinstance(normalized.get("properties"), dict):
+        normalized["properties"] = {}
+    return normalized
+
+
+def qualify_namespace_tool_name(namespace: str, child_name: str) -> str:
+    namespace = namespace.strip()
+    child_name = child_name.strip()
+    if not child_name or not namespace or child_name.startswith("mcp__"):
+        return child_name
+    if child_name.startswith(namespace):
+        return child_name
+    if namespace.endswith("__"):
+        return f"{namespace}{child_name}"
+    return f"{namespace}__{child_name}"
+
+
+def sanitize_tool_name(name: str) -> str:
+    sanitized = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+    return sanitized or f"tool_{uuid.uuid4().hex[:8]}"
 
 
 def convert_response_format(body: dict[str, Any]) -> dict[str, Any] | None:
@@ -233,7 +384,7 @@ def chat_completion_to_response(
     error: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     created_at = created_at or int(time.time())
-    output = chat_to_output_items(chat_data)
+    output = chat_to_output_items(chat_data, request_body=request_body)
     return {
         "id": response_id,
         "object": "response",
@@ -263,7 +414,7 @@ def chat_completion_to_response(
     }
 
 
-def chat_to_output_items(chat_data: dict[str, Any]) -> list[dict[str, Any]]:
+def chat_to_output_items(chat_data: dict[str, Any], request_body: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     choices = chat_data.get("choices")
     if not isinstance(choices, list) or not choices:
         return []
@@ -284,21 +435,49 @@ def chat_to_output_items(chat_data: dict[str, Any]) -> list[dict[str, Any]]:
         )
     for call in message.get("tool_calls") or []:
         if isinstance(call, dict):
-            output.append(chat_tool_call_to_response(call))
+            output.append(chat_tool_call_to_response(call, request_body=request_body))
     return output
 
 
-def chat_tool_call_to_response(call: dict[str, Any]) -> dict[str, Any]:
+def chat_tool_call_to_response(call: dict[str, Any], request_body: dict[str, Any] | None = None) -> dict[str, Any]:
     raw_function = call.get("function")
     function: dict[str, Any] = raw_function if isinstance(raw_function, dict) else {}
-    return {
+    name = str(function.get("name") or "")
+    child_name, namespace = split_namespace_tool_name(request_body, name)
+    item = {
         "id": str(call.get("id") or f"fc_{uuid.uuid4().hex}"),
         "type": "function_call",
         "status": "completed",
         "call_id": str(call.get("id") or f"call_{uuid.uuid4().hex}"),
-        "name": str(function.get("name") or ""),
+        "name": child_name or name,
         "arguments": str(function.get("arguments") or ""),
     }
+    if namespace:
+        item["namespace"] = namespace
+    return item
+
+
+def split_namespace_tool_name(request_body: dict[str, Any] | None, qualified_name: str) -> tuple[str, str]:
+    qualified_name = qualified_name.strip()
+    if not request_body:
+        return qualified_name, ""
+    tools = request_body.get("tools")
+    if not isinstance(tools, list):
+        return qualified_name, ""
+    for tool in tools:
+        if not isinstance(tool, dict) or tool.get("type") != "namespace":
+            continue
+        namespace = str(tool.get("name") or "").strip()
+        children = tool.get("tools")
+        if not namespace or not isinstance(children, list):
+            continue
+        for child in children:
+            if not isinstance(child, dict):
+                continue
+            child_name = responses_tool_name(child)
+            if qualify_namespace_tool_name(namespace, child_name) == qualified_name:
+                return child_name, namespace
+    return qualified_name, ""
 
 
 def output_text(output: list[dict[str, Any]]) -> str:
@@ -318,12 +497,16 @@ def response_to_history_messages(response: dict[str, Any]) -> list[dict[str, Any
     tool_calls: list[dict[str, Any]] = []
     for item in response.get("output", []):
         if isinstance(item, dict) and item.get("type") == "function_call":
+            name = str(item.get("name") or "")
+            namespace = str(item.get("namespace") or "")
+            if namespace:
+                name = qualify_namespace_tool_name(namespace, name)
             tool_calls.append(
                 {
                     "id": item.get("call_id") or item.get("id"),
                     "type": "function",
                     "function": {
-                        "name": item.get("name", ""),
+                        "name": sanitize_tool_name(name),
                         "arguments": item.get("arguments", ""),
                     },
                 }
