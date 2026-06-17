@@ -671,6 +671,7 @@ def build_app(
                 "x-deveco-account",
                 "content-length",
                 "content-type",
+                "accept",
                 "connection",
                 "accept-encoding",
             }:
@@ -816,13 +817,19 @@ def build_app(
             raise HTTPException(status_code=400, detail="JSON body must be an object")
 
         previous_response = None
+        previous_input_items = None
         previous_response_id = body_json.get("previous_response_id")
         if previous_response_id:
             previous_response = get_response(str(previous_response_id))
             if previous_response is None:
                 raise HTTPException(status_code=404, detail="Previous response not found")
+            previous_input_items = get_input_items(str(previous_response_id))
 
-        chat_body, input_items = build_chat_request(body_json, previous_response=previous_response)
+        chat_body, input_items = build_chat_request(
+            body_json,
+            previous_response=previous_response,
+            previous_input_items=previous_input_items,
+        )
         stream = bool(body_json.get("stream"))
         model = str(body_json.get("model") or "")
         target_path = "v2/chat/completions" if stream else "v2/no-stream/chat/completions"
@@ -845,6 +852,7 @@ def build_app(
                 "x-deveco-account",
                 "content-length",
                 "content-type",
+                "accept",
                 "connection",
                 "accept-encoding",
             }:

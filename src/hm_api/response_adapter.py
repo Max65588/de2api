@@ -34,7 +34,13 @@ def new_response_id() -> str:
 
 
 def sse_event(event: str, data: dict[str, Any]) -> bytes:
-    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    if event in {"response.created", "response.completed", "response.failed"} and data.get("object") == "response":
+        event_data = {"type": event, "response": data}
+    else:
+        event_data = {**data}
+        event_data.setdefault("type", event)
+    event_data.setdefault("sequence_number", 0)
+    payload = json.dumps(event_data, ensure_ascii=False, separators=(",", ":"))
     return f"event: {event}\ndata: {payload}\n\n".encode("utf-8")
 
 
@@ -99,6 +105,7 @@ def input_to_messages(input_value: Any) -> tuple[list[dict[str, Any]], list[dict
 def build_chat_request(
     body: dict[str, Any],
     previous_response: dict[str, Any] | None = None,
+    previous_input_items: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     unsupported = sorted(set(body) - SUPPORTED_RESPONSE_FIELDS)
     if unsupported:
@@ -116,6 +123,8 @@ def build_chat_request(
     if body.get("instructions"):
         messages.append({"role": "system", "content": str(body["instructions"])})
     if previous_response:
+        if previous_input_items:
+            messages.extend(input_items_to_history_messages(previous_input_items))
         messages.extend(response_to_history_messages(previous_response))
     input_messages, input_items = input_to_messages(body.get("input", ""))
     messages.extend(input_messages)
@@ -306,6 +315,36 @@ def response_to_history_messages(response: dict[str, Any]) -> list[dict[str, Any
         if tool_calls:
             message["tool_calls"] = tool_calls
         messages.append(message)
+    return messages
+
+
+def input_items_to_history_messages(input_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    for item in input_items:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type == "message":
+            role = str(item.get("role") or "user")
+            content_parts = item.get("content", [])
+            if isinstance(content_parts, list):
+                text = "".join(
+                    str(part.get("text") or "")
+                    for part in content_parts
+                    if isinstance(part, dict) and part.get("type") in {"input_text", "output_text", "text"}
+                )
+            else:
+                text = str(content_parts)
+            messages.append({"role": role, "content": text})
+            continue
+        if item_type == "function_call_output":
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": str(item.get("call_id") or ""),
+                    "content": str(item.get("output") or ""),
+                }
+            )
     return messages
 
 
