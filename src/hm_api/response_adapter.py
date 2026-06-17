@@ -26,6 +26,21 @@ SUPPORTED_RESPONSE_FIELDS = {
     "text",
     "response_format",
     "user",
+    "background",
+    "client_metadata",
+    "conversation",
+    "include",
+    "max_tool_calls",
+    "parallel_tool_calls",
+    "prompt",
+    "prompt_cache_key",
+    "prompt_cache_retention",
+    "reasoning",
+    "safety_identifier",
+    "service_tier",
+    "stream_options",
+    "top_logprobs",
+    "truncation",
 }
 
 
@@ -112,8 +127,9 @@ def build_chat_request(
         raise response_error(f"Unsupported Responses request fields: {', '.join(unsupported)}")
     if body.get("background"):
         raise response_error("background responses are not supported.")
-    if body.get("include"):
-        raise response_error("include is not supported.")
+    include = body.get("include")
+    if include is not None and not isinstance(include, list):
+        raise response_error("include must be an array.", "invalid_include")
 
     model = body.get("model")
     if not model:
@@ -137,6 +153,8 @@ def build_chat_request(
     for key in ("temperature", "top_p", "user"):
         if key in body:
             chat_body[key] = body[key]
+    if body.get("parallel_tool_calls") is not None:
+        chat_body["parallel_tool_calls"] = body["parallel_tool_calls"]
     if "max_output_tokens" in body:
         chat_body["max_tokens"] = body["max_output_tokens"]
     if "tools" in body:
@@ -226,20 +244,20 @@ def chat_completion_to_response(
         "incomplete_details": None,
         "instructions": request_body.get("instructions"),
         "max_output_tokens": request_body.get("max_output_tokens"),
-        "metadata": request_body.get("metadata") or {},
+        "metadata": request_body.get("metadata") or request_body.get("client_metadata") or {},
         "model": request_body.get("model") or chat_data.get("model"),
         "output": output,
         "output_text": output_text(output),
-        "parallel_tool_calls": True,
+        "parallel_tool_calls": request_body.get("parallel_tool_calls", True),
         "previous_response_id": request_body.get("previous_response_id"),
-        "reasoning": {"effort": None, "summary": None},
+        "reasoning": request_body.get("reasoning") or {"effort": None, "summary": None},
         "store": request_body.get("store", True) is not False,
         "temperature": request_body.get("temperature"),
         "text": request_body.get("text", {"format": {"type": "text"}}),
         "tool_choice": request_body.get("tool_choice", "auto"),
         "tools": request_body.get("tools", []),
         "top_p": request_body.get("top_p"),
-        "truncation": "disabled",
+        "truncation": request_body.get("truncation", "disabled"),
         "usage": convert_usage(chat_data.get("usage")),
         "user": request_body.get("user"),
     }
